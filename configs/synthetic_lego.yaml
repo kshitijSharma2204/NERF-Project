@@ -1,0 +1,26 @@
+data:
+  root: ./data/synthetic/lego
+  height: 400
+  width: 400
+  focal: AUTO
+
+model:
+  coarse:
+    n_layers: 8
+    hidden_dim: 256
+    depth_samples: 64
+  fine:
+    n_layers: 8
+    hidden_dim: 256
+    depth_samples: 128
+
+training:
+  batch_rays: 1024
+  lr: 5e-4
+  max_steps: 300000
+  log_interval: 100
+  val_interval: 5000
+  save_interval: 50000
+
+render:
+  render_only: false
