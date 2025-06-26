@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -e
 
-
 # Train
 python3 -m scripts.train \
   --config configs/synthetic_lego.yaml \
@@ -9,10 +8,11 @@ python3 -m scripts.train \
   --resume
 
 # Render
-python3 scripts.render \
+LATEST=$(ls logs/lego_full/checkpoint_*.pth | sort -V | tail -n1)
+python3 -m scripts.render \
   --config  configs/synthetic_lego.yaml \
   --expname lego_full \
-  --ckpt    logs/lego_full/checkpoint_last.pth.pth \
+  --ckpt    "$LATEST" \
   --split   test \
   --outdir  outputs/lego_test
 

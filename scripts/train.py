@@ -13,6 +13,28 @@ from scripts.data_loader import NeRFDataset
 from scripts.render_rays import render_rays
 from models.nerf import PosEncoding, NeRFMLP
 
+import re, glob
+def find_last_ckpt_and_step(logdir, device):
+    # 1) Glob only the numeric checkpoints
+    pattern = os.path.join(logdir, "checkpoint_*.pth")
+    all_ckpts = glob.glob(pattern)
+    # 2) Exclude checkpoint_last.pth
+    num_ckpts = [p for p in all_ckpts 
+                 if re.match(r".*checkpoint_\d+\.pth$", os.path.basename(p))]
+    if not num_ckpts:
+        return None, 0, None
+    # 3) Build (step, path) pairs
+    pairs = []
+    for p in num_ckpts:
+        m = re.search(r"checkpoint_(\d+)\.pth$", os.path.basename(p))
+        if m:
+            pairs.append((int(m.group(1)), p))
+    # 4) Find the max step
+    last_step, last_path = max(pairs, key=lambda x: x[0])
+    # 5) Load it
+    ck = torch.load(last_path, map_location=device)
+    return ck, last_step, last_path
+
 def train(cfg, expname, resume):
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,13 +71,16 @@ def train(cfg, expname, resume):
     optimizer = optim.Adam(list(coarse.parameters()) + list(fine.parameters()), lr=float(cfg["training"]["lr"]))
 
     # 6) resume if requested
+    start_step = 0
     if resume:
-        last_ckpt = os.path.join(logdir, "checkpoint_last.pth")
-        if os.path.isfile(last_ckpt):
-            ck = torch.load(last_ckpt, map_location=device)  # Load to correct device
+        ck, last_step, ck_path = find_last_ckpt_and_step(logdir, device)
+        if ck is not None:
             coarse.load_state_dict(ck["coarse"])
             fine.load_state_dict(ck["fine"])
-            print(f"Resumed from {last_ckpt}")
+            start_step = last_step + 1
+            print(f"Resuming from iteration {start_step} (loaded  {os.path.basename(ck_path)})")
+        else:
+            print("No checkpoint_* found; starting from scratch")
 
     # 7) training params
     max_steps = cfg["training"]["max_steps"]
@@ -64,8 +89,8 @@ def train(cfg, expname, resume):
     val_interval = cfg["training"]["val_interval"]
     save_interval = cfg["training"]["save_interval"]
 
-    # 8) main loop
-    for step in tqdm(range(max_steps), desc="Training", leave=True):
+    # 8) main loop: start from wherever we left off
+    for step in tqdm(range(start_step, max_steps), desc="Training", leave=True):
         # sample random rays
         img_i = random.randrange(len(ds.images))
         rays_o, rays_d, target = ds.get_rays(img_i)
@@ -95,9 +120,22 @@ def train(cfg, expname, resume):
 
         # optional val & checkpoint
         if step and step % save_interval == 0:
-            ck = {"coarse": coarse.state_dict(), "fine": fine.state_dict()}
+            # include the iteration counter in every save
+            ck = {"coarse": coarse.state_dict(), "fine": fine.state_dict(), "step": step}
             torch.save(ck, os.path.join(logdir, f"checkpoint_{step}.pth"))
-            torch.save(ck, os.path.join(logdir, "checkpoint_last.pth"))
+    
+
+    # ensure we save the very last step even if it's not on a save_interval
+    final_step = max_steps - 1
+    # only if we didn’t already save it
+    if final_step % save_interval != 0:
+        ck = {"coarse": coarse.state_dict(),
+              "fine":   fine.state_dict(),
+              "step":   final_step}
+        path = os.path.join(logdir, f"checkpoint_{final_step}.pth")
+        torch.save(ck, path)
+        print(f"[INFO] Saved final checkpoint at step {final_step}: {path}")
+            
 
     writer.close()
 

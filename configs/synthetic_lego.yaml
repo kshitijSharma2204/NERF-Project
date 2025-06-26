@@ -20,7 +20,7 @@ training:
   max_steps: 300000
   log_interval: 100
   val_interval: 5000
-  save_interval: 50000
+  save_interval: 3000
 
 render:
   render_only: false
