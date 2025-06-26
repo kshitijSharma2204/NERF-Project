@@ -3,5 +3,4 @@ __pycache__/
 logs/
 *.pth
 *.pt
-*.png
 data/
