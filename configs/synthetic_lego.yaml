@@ -8,6 +8,10 @@ data:
 model:
   near: 2.0
   far: 6.0
+  # Gaussian noise on raw density during training (NeRF paper regulariser). Without it,
+  # seed 0 collapsed: fine-MLP raw sigma < 0 everywhere -> zero ReLU gradient -> white.
+  raw_noise_std: 1.0
+  density_activation: relu   # relu (paper) | softplus
   coarse:
     n_layers: 8
     hidden_dim: 256
