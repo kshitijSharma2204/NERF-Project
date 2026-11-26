@@ -19,7 +19,12 @@ import torch
 
 from scripts.data_loader import NeRFDataset
 from scripts.metrics import psnr, ssim
-from scripts.render import load_models_from_ckpt, load_occupancy_from_ckpt, render_poses
+from scripts.render import (
+    _check_outdir,
+    load_models_from_ckpt,
+    load_occupancy_from_ckpt,
+    render_poses,
+)
 from scripts.utils import configure_fp32, get_device, git_sha, load_config
 
 PROTOCOL = (
@@ -43,7 +48,9 @@ def evaluate(cfg: dict, ckpt_path: str, outdir: str, split: str = "test",
     device = get_device()
     if not cfg["data"].get("white_bkgd", True):
         raise ValueError("v2 evaluation uses white-composited ground truth (data.white_bkgd)")
-    indices = list(range(limit)) if limit else None
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    indices = list(range(limit)) if limit is not None else None
     ds = NeRFDataset(cfg, split=split, indices=indices)
     coarse, fine, peXYZ, peDir, ck = load_models_from_ckpt(cfg, ckpt_path, device)
     occ = load_occupancy_from_ckpt(cfg, ck, device)
@@ -102,6 +109,7 @@ def main() -> None:
     p.add_argument("--split", default="test")
     p.add_argument("--limit", type=int, default=None, help="only the first N views (smoke test)")
     args = p.parse_args()
+    _check_outdir(args.outdir)
     m = evaluate(load_config(args.config), args.ckpt, args.outdir, args.split, args.limit)
     print(f"{m['n_views']} {m['split']} views at {m['resolution'][0]}x{m['resolution'][1]}, "
           f"step {m['checkpoint_step']}: PSNR {m['psnr']['mean']:.2f} +/- {m['psnr']['std']:.2f} "

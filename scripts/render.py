@@ -122,6 +122,10 @@ def main() -> None:
     coarse, fine, peXYZ, peDir, ck = load_models_from_ckpt(cfg, args.ckpt, device)
     occ = load_occupancy_from_ckpt(cfg, ck, device)
     poses = spherical_path(args.n_frames) if args.path == "spherical" else ds.poses
+    if args.video:  # ffmpeg reads every NNN.png: drop frames left by an earlier, longer render
+        for name in os.listdir(args.outdir) if os.path.isdir(args.outdir) else []:
+            if len(name) == 7 and name.endswith(".png") and name[:3].isdigit():
+                os.remove(os.path.join(args.outdir, name))
     render_poses(cfg, (coarse, fine, peXYZ, peDir), poses, ds.H, ds.W, ds.focal, device,
                  args.outdir, occ=occ)
     if args.video:

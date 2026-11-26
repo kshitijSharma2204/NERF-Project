@@ -79,3 +79,25 @@ def test_checkpoint_has_full_state(tiny_cfg, tmp_path, monkeypatch):
 def test_apply_overrides_parses_yaml_values():
     cfg = apply_overrides({"a": {"b": 1}}, ["a.b=2.5", "a.c=true", "seed=7"])
     assert cfg == {"a": {"b": 2.5, "c": True}, "seed": 7}
+
+
+def test_truncate_metrics_drops_torn_line_and_later_steps(tmp_path):
+    from scripts.train import truncate_metrics
+    path = tmp_path / "metrics.jsonl"
+    path.write_text('{"step": 0, "loss": 1}\n{"step": 5, "loss": 2}\n{"step": 9, "lo')
+    truncate_metrics(str(path), 5)
+    assert path.read_text() == '{"step": 0, "loss": 1}\n'
+
+
+def test_fresh_run_refuses_logdir_with_old_checkpoints(tiny_cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("NERF_DEVICE", "cpu")
+    train(copy.deepcopy(tiny_cfg), "run", resume=False, logroot=str(tmp_path))
+    with pytest.raises(SystemExit):
+        train(copy.deepcopy(tiny_cfg), "run", resume=False, logroot=str(tmp_path))
+
+
+def test_apply_overrides_rejects_malformed_items():
+    with pytest.raises(ValueError):
+        apply_overrides({"a": 1}, ["a"])
+    with pytest.raises(ValueError):
+        apply_overrides({"seed": 1}, ["seed.x=2"])

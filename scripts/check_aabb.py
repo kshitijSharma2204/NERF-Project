@@ -31,7 +31,7 @@ def visual_hull_bounds(root: str, search: float = 3.0, res: int = 160, dilate: i
     n_seen = torch.zeros(pts.shape[0], dtype=torch.int32, device=device)
     for fr in meta["frames"]:
         img = Image.open(os.path.join(root, fr["file_path"] + ".png"))
-        alpha = torch.from_numpy(np.asarray(img)[..., 3] > 0).float().to(device)
+        alpha = torch.from_numpy(np.asarray(img.convert("RGBA"))[..., 3] > 0).float().to(device)
         if dilate:
             alpha = F.max_pool2d(alpha[None, None], 2 * dilate + 1, 1, dilate)[0, 0]
         H, W = alpha.shape
@@ -48,6 +48,8 @@ def visual_hull_bounds(root: str, search: float = 3.0, res: int = 160, dilate: i
         keep &= ~seen | fg  # carve points a camera sees as background
         n_seen += seen.int()
     hull = pts[keep & (n_seen >= min_views)]
+    if len(hull) == 0:
+        raise SystemExit(f"empty visual hull (no point seen by >= {min_views} views)")
     return hull.min(0).values.cpu().numpy(), hull.max(0).values.cpu().numpy(), len(hull)
 
 

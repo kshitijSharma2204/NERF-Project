@@ -11,7 +11,14 @@ import yaml
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from scripts.checkpoint import capture_rng, find_last_ckpt_and_step, restore_rng, save_checkpoint
+from scripts.checkpoint import (
+    LAST,
+    capture_rng,
+    find_last_ckpt_and_step,
+    numbered_checkpoints,
+    restore_rng,
+    save_checkpoint,
+)
 from scripts.data_loader import NeRFDataset
 from scripts.metrics import psnr as psnr_metric
 from scripts.occupancy import build_occupancy
@@ -74,11 +81,17 @@ def apply_overrides(cfg: dict, overrides: list[str]) -> dict:
     """Return a copy of cfg with dotted overrides applied, e.g. 'training.max_steps=1000'."""
     cfg = copy.deepcopy(cfg)
     for item in overrides:
-        key, _, raw = item.partition("=")
+        key, sep, raw = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"override {item!r} is not KEY=VALUE")
         node = cfg
         *parents, leaf = key.split(".")
         for k in parents:
             node = node.setdefault(k, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"override {item!r}: {k!r} is not a section")
+        if leaf not in node:
+            print(f"[WARN] override adds new key {key!r} (not in the config; typo?)")
         node[leaf] = yaml.safe_load(raw)
     return cfg
 
@@ -87,10 +100,18 @@ def truncate_metrics(path: str, start_step: int) -> None:
     """Drop metric lines at or after start_step (all of them for a fresh run)."""
     if not os.path.exists(path):
         return
+    keep = []
     with open(path) as f:
-        keep = [ln for ln in f if ln.strip() and json.loads(ln)["step"] < start_step]
-    with open(path, "w") as f:
+        for ln in f:
+            try:
+                if json.loads(ln)["step"] < start_step:
+                    keep.append(ln if ln.endswith("\n") else ln + "\n")
+            except (json.JSONDecodeError, KeyError):
+                pass  # torn line from a killed run
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         f.writelines(keep)
+    os.replace(tmp, path)
 
 
 def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
@@ -140,6 +161,9 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             print(f"Resuming from step {start_step} (loaded {os.path.basename(ck_path)})")
         else:
             print("No checkpoint found; starting from scratch")
+    elif numbered_checkpoints(logdir) or os.path.exists(os.path.join(logdir, LAST)):
+        raise SystemExit(f"{logdir} already has checkpoints from another run: use --resume to "
+                         "continue it, or pick a new --expname")
     truncate_metrics(metrics_path, start_step)
 
     max_steps = int(tcfg["max_steps"])
@@ -170,6 +194,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
         tqdm.write(f"step {step} val/psnr {mean:.2f} dB ({secs:.1f} s)")
 
     def checkpoint(step: int) -> str:
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"non-finite loss at step {step}; not saving a checkpoint")
         return save_checkpoint(logdir, {
             "coarse": coarse.state_dict(),
             "fine": fine.state_dict(),
