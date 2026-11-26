@@ -210,8 +210,9 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             occ.update(coarse, peXYZ)
         rgb_coarse, rgb_fine = render_rays(coarse_fwd, fine_fwd, peXYZ, peDir, rays_o, rays_d,
                                            cfg, perturb=True, occ=occ)
+        mse_c = ((rgb_coarse - target) ** 2).mean()
         mse_f = ((rgb_fine - target) ** 2).mean()
-        loss = ((rgb_coarse - target) ** 2).mean() + mse_f
+        loss = mse_c + mse_f
         lr = lr_at(step, lr0, lr_decay_steps, lr_decay_rate)
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -228,14 +229,17 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             ms = 1000.0 * (now - t_last) / n
             t_last = now
             psnr = -10.0 * torch.log10(mse_f).item()
+            psnr_c = -10.0 * torch.log10(mse_c).item()
             mem_gib = (torch.cuda.max_memory_allocated() / 2**30
                        if device.type == "cuda" else 0.0)
             writer.add_scalar("mem/peak_gib", mem_gib, step)
             writer.add_scalar("loss/train", loss_val, step)
             writer.add_scalar("psnr/train", psnr, step)
+            writer.add_scalar("psnr/train_coarse", psnr_c, step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("time/ms_per_step", ms, step)
-            rec = {"step": step, "loss": loss_val, "psnr_train": psnr, "lr": lr,
+            rec = {"step": step, "loss": loss_val, "psnr_train": psnr,
+                   "psnr_train_coarse": psnr_c, "lr": lr,
                    "ms_per_step": ms, "peak_mem_gib": mem_gib}
             occ_msg = ""
             if occ is not None:
@@ -247,7 +251,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
                 occ_msg = f" skip {rec['skipped_frac']:.3f} occ {rec['occupied_frac']:.3f}"
             with open(metrics_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
-            tqdm.write(f"step {step} loss {loss_val:.5f} psnr {psnr:.2f} lr {lr:.2e} "
+            tqdm.write(f"step {step} loss {loss_val:.5f} psnr fine {psnr:.2f} coarse {psnr_c:.2f} "
+                       f"lr {lr:.2e} "
                        f"{ms:.1f} ms/step{occ_msg}")
 
         if step and step % val_interval == 0:
