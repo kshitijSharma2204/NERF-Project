@@ -27,6 +27,11 @@ training:
   val_interval: 5000
   val_indices: [0, 33, 66]   # fixed val views, rendered deterministically for val/psnr
   save_interval: 3000
+  keep_ckpts: 3        # numbered checkpoints kept, plus checkpoint_last.pth
+  compile: true        # torch.compile the MLPs (fp32 math)
+  fused_adam: true     # fused CUDA Adam (fp32 math)
+
+seed: 0
 
 render:
-  render_only: false
+  chunk_size: 4096    # rays per forward pass when rendering full images

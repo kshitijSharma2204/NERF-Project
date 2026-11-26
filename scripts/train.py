@@ -108,7 +108,13 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
     val_ds = NeRFDataset(cfg, split="val", indices=val_indices) if val_indices else None
     coarse, fine, peXYZ, peDir = build_models(cfg, device)
     params = list(coarse.parameters()) + list(fine.parameters())
-    optimizer = torch.optim.Adam(params, lr=float(tcfg["lr"]))
+    # fused Adam and torch.compile keep fp32 math (TF32 is off via configure_fp32)
+    fused = bool(tcfg.get("fused_adam", False)) and device.type == "cuda"
+    optimizer = torch.optim.Adam(params, lr=float(tcfg["lr"]), fused=fused)
+    if bool(tcfg.get("compile", False)):
+        coarse_fwd, fine_fwd = torch.compile(coarse), torch.compile(fine)
+    else:
+        coarse_fwd, fine_fwd = coarse, fine
 
     start_step = 0
     if resume:
@@ -190,8 +196,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
         rays_o, rays_d = rays_at_pixels(i.float(), j.float(), H, W, focal, poses[img_i])
         target = images[img_i, j, i]
 
-        rgb_coarse, rgb_fine = render_rays(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg,
-                                           perturb=True)
+        rgb_coarse, rgb_fine = render_rays(coarse_fwd, fine_fwd, peXYZ, peDir, rays_o, rays_d,
+                                           cfg, perturb=True)
         mse_f = ((rgb_fine - target) ** 2).mean()
         loss = ((rgb_coarse - target) ** 2).mean() + mse_f
         lr = lr_at(step, lr0, lr_decay_steps, lr_decay_rate)
@@ -210,13 +216,17 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             ms = 1000.0 * (now - t_last) / n
             t_last = now
             psnr = -10.0 * torch.log10(mse_f).item()
+            mem_gib = (torch.cuda.max_memory_allocated() / 2**30
+                       if device.type == "cuda" else 0.0)
+            writer.add_scalar("mem/peak_gib", mem_gib, step)
             writer.add_scalar("loss/train", loss_val, step)
             writer.add_scalar("psnr/train", psnr, step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("time/ms_per_step", ms, step)
             with open(metrics_path, "a") as f:
                 f.write(json.dumps({"step": step, "loss": loss_val, "psnr_train": psnr,
-                                    "lr": lr, "ms_per_step": ms}) + "\n")
+                                    "lr": lr, "ms_per_step": ms,
+                                    "peak_mem_gib": mem_gib}) + "\n")
             tqdm.write(f"step {step} loss {loss_val:.5f} psnr {psnr:.2f} lr {lr:.2e} "
                        f"{ms:.1f} ms/step")
 
