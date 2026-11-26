@@ -4,6 +4,7 @@ import os
 import random
 
 import numpy as np
+import pytest
 import torch
 
 from scripts.checkpoint import (
@@ -30,6 +31,18 @@ def test_rng_roundtrip_through_weights_only_load(tmp_path):
     expected = (random.random(), np.random.rand(), torch.rand(1).item())
     restore_rng(torch.load(path, weights_only=True)["rng"])
     assert (random.random(), np.random.rand(), torch.rand(1).item()) == expected
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rng_restores_after_loading_onto_cuda(tmp_path):
+    # Regression: map_location=cuda moved the numpy key tensor to the GPU on resume.
+    np.random.seed(5)
+    path = str(tmp_path / "rng.pth")
+    torch.save({"rng": capture_rng()}, path)
+    expected = np.random.rand()
+    restore_rng(torch.load(path, map_location="cuda", weights_only=True)["rng"])
+    assert np.random.rand() == expected
 
 
 def test_keeps_newest_three_numbered_plus_last(tmp_path):

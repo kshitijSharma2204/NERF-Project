@@ -32,7 +32,7 @@ def restore_rng(state: dict) -> None:
     random.setstate(_to_tuple(state["python"]))
     n = state["numpy"]
     np.random.set_state(
-        (n["name"], n["keys"].numpy().astype(np.uint32), n["pos"], n["has_gauss"],
+        (n["name"], n["keys"].cpu().numpy().astype(np.uint32), n["pos"], n["has_gauss"],
          n["cached_gaussian"])
     )
     torch.set_rng_state(state["torch"].cpu())
