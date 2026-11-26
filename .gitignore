@@ -4,3 +4,17 @@ logs/
 *.pth
 *.pt
 data/
+.venv/
+.pytest_cache/
+.ruff_cache/
+# v2 media: commit eval files, the video/GIF and the test renders quoted in docs/RESULTS.md only
+outputs/v2/video_frames/
+outputs/v2/test/*
+!outputs/v2/test/150.png
+!outputs/v2/test/162.png
+!outputs/v2/test/178.png
+!outputs/v2/test/193.png
+!outputs/v2/test/159.png
+!outputs/v2/test/160.png
+!outputs/v2/test/161.png
+!outputs/v2/test/081.png

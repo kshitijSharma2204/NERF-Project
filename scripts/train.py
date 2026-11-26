@@ -1,150 +1,327 @@
 #!/usr/bin/env python3
+import argparse
+import copy
+import json
 import os
 import random
-import argparse
-import yaml
-from tqdm import tqdm
+import time
 
 import torch
-import torch.optim as optim
+import yaml
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
+from scripts.checkpoint import (
+    LAST,
+    capture_rng,
+    find_last_ckpt_and_step,
+    numbered_checkpoints,
+    restore_rng,
+    save_checkpoint,
+)
 from scripts.data_loader import NeRFDataset
-from scripts.render_rays import render_rays
-from models.nerf import PosEncoding, NeRFMLP
+from scripts.metrics import psnr as psnr_metric
+from scripts.occupancy import build_occupancy
+from scripts.render_rays import render_image, render_rays
+from scripts.utils import (
+    build_models,
+    configure_fp32,
+    get_device,
+    git_sha,
+    model_config_mismatch,
+    rays_at_pixels,
+    rays_for_pose,
+    set_seed,
+)
 
-import re, glob
-def find_last_ckpt_and_step(logdir, device):
-    # 1) Glob only the numeric checkpoints
-    pattern = os.path.join(logdir, "checkpoint_*.pth")
-    all_ckpts = glob.glob(pattern)
-    # 2) Exclude checkpoint_last.pth
-    num_ckpts = [p for p in all_ckpts 
-                 if re.match(r".*checkpoint_\d+\.pth$", os.path.basename(p))]
-    if not num_ckpts:
-        return None, 0, None
-    # 3) Build (step, path) pairs
-    pairs = []
-    for p in num_ckpts:
-        m = re.search(r"checkpoint_(\d+)\.pth$", os.path.basename(p))
-        if m:
-            pairs.append((int(m.group(1)), p))
-    # 4) Find the max step
-    last_step, last_path = max(pairs, key=lambda x: x[0])
-    # 5) Load it
-    ck = torch.load(last_path, map_location=device)
-    return ck, last_step, last_path
 
-def train(cfg, expname, resume):
-    # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+def lr_at(step: int, lr0: float, decay_steps: int, decay_rate: float = 0.1) -> float:
+    """Original NeRF schedule: lr0 * decay_rate ** (step / decay_steps)."""
+    return lr0 * decay_rate ** (step / decay_steps)
 
-    # Set up log dir
-    logdir = os.path.join("logs", expname)
+
+def sample_pixels(
+    n: int, H: int, W: int, crop_frac: float | None, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random pixel (column i, row j) indices; only the central crop_frac region if given.
+
+    Matches nerf-pytorch's precrop: rows in [H/2 - dH, H/2 + dH) with dH = H/2 * frac.
+    """
+    if crop_frac is not None:
+        dH, dW = int(H // 2 * crop_frac), int(W // 2 * crop_frac)
+        j = torch.randint(H // 2 - dH, H // 2 + dH, (n,), device=device)
+        i = torch.randint(W // 2 - dW, W // 2 + dW, (n,), device=device)
+    else:
+        j = torch.randint(0, H, (n,), device=device)
+        i = torch.randint(0, W, (n,), device=device)
+    return i, j
+
+
+def validate(cfg: dict, val_ds: NeRFDataset, models: tuple, device: torch.device,
+             occ=None) -> list[tuple]:
+    """Deterministically render the fixed val views. Returns [(name, psnr, image)]."""
+    coarse, fine, peXYZ, peDir = models
+    chunk = cfg.get("render", {}).get("chunk_size", 4096)
+    coarse.eval()
+    fine.eval()
+    out = []
+    for k in range(len(val_ds.images)):
+        c2w = torch.as_tensor(val_ds.poses[k], device=device)
+        rays_o, rays_d = rays_for_pose(val_ds.H, val_ds.W, val_ds.focal, c2w)
+        rgb = render_image(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg, chunk=chunk,
+                           occ=occ)
+        img = rgb.clamp(0, 1).reshape(val_ds.H, val_ds.W, 3)
+        gt = torch.as_tensor(val_ds.images[k], device=device)
+        out.append((val_ds.names[k], psnr_metric(img, gt), img))
+    coarse.train()
+    fine.train()
+    return out
+
+
+def apply_overrides(cfg: dict, overrides: list[str]) -> dict:
+    """Return a copy of cfg with dotted overrides applied, e.g. 'training.max_steps=1000'."""
+    cfg = copy.deepcopy(cfg)
+    for item in overrides:
+        key, sep, raw = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"override {item!r} is not KEY=VALUE")
+        node = cfg
+        *parents, leaf = key.split(".")
+        for k in parents:
+            node = node.setdefault(k, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"override {item!r}: {k!r} is not a section")
+        if leaf not in node:
+            print(f"[WARN] override adds new key {key!r} (not in the config; typo?)")
+        node[leaf] = yaml.safe_load(raw)
+    return cfg
+
+
+def truncate_metrics(path: str, start_step: int) -> None:
+    """Drop metric lines at or after start_step (all of them for a fresh run)."""
+    if not os.path.exists(path):
+        return
+    keep = []
+    with open(path) as f:
+        for ln in f:
+            try:
+                if json.loads(ln)["step"] < start_step:
+                    keep.append(ln if ln.endswith("\n") else ln + "\n")
+            except (json.JSONDecodeError, KeyError):
+                pass  # torn line from a killed run
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(keep)
+    os.replace(tmp, path)
+
+
+def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
+    """Train coarse+fine NeRF. Returns a summary dict (final step, last loss, logdir)."""
+    configure_fp32()
+    device = get_device()
+    tcfg = cfg["training"]
+    seed = int(cfg.get("seed", 0))
+    set_seed(seed)
+
+    logdir = os.path.join(logroot, expname)
     os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(logdir)
+    metrics_path = os.path.join(logdir, "metrics.jsonl")
 
-    # 1) dataset
     ds = NeRFDataset(cfg, split="train")
+    val_indices = list(tcfg.get("val_indices", [0, 33, 66]))
+    val_ds = NeRFDataset(cfg, split="val", indices=val_indices) if val_indices else None
+    coarse, fine, peXYZ, peDir = build_models(cfg, device)
+    params = list(coarse.parameters()) + list(fine.parameters())
+    # fused Adam and torch.compile keep fp32 math (TF32 is off via configure_fp32)
+    fused = bool(tcfg.get("fused_adam", False)) and device.type == "cuda"
+    optimizer = torch.optim.Adam(params, lr=float(tcfg["lr"]), fused=fused)
+    if bool(tcfg.get("compile", False)):
+        coarse_fwd, fine_fwd = torch.compile(coarse), torch.compile(fine)
+    else:
+        coarse_fwd, fine_fwd = coarse, fine
+    occ = build_occupancy(cfg, device)
 
-    # 2) positional encoders (use defaults if missing)
-    enc = cfg["model"].get("encoding", {})
-    pos_freqs = enc.get("pos_freqs", 10)
-    dir_freqs = enc.get("dir_freqs", 4)
-    peXYZ = PosEncoding(pos_freqs)
-    peDir = PosEncoding(dir_freqs)
-
-    # 3) channel sizes
-    input_ch = 3 + 2 * 3 * pos_freqs
-    input_ch_dir = 3 + 2 * 3 * dir_freqs
-
-    # 4) build MLPs (architecture only; use positional args to match signature)
-    c_cfg = cfg["model"]["coarse"]
-    f_cfg = cfg["model"]["fine"]
-    coarse = NeRFMLP(c_cfg["n_layers"], c_cfg["hidden_dim"], input_ch, input_ch_dir)
-    fine = NeRFMLP(f_cfg["n_layers"], f_cfg["hidden_dim"], input_ch, input_ch_dir)
-    coarse = coarse.to(device)  # Move to GPU
-    fine = fine.to(device)      # Move to GPU
-
-    # 5) optimizer
-    optimizer = optim.Adam(list(coarse.parameters()) + list(fine.parameters()), lr=float(cfg["training"]["lr"]))
-
-    # 6) resume if requested
     start_step = 0
     if resume:
         ck, last_step, ck_path = find_last_ckpt_and_step(logdir, device)
         if ck is not None:
             coarse.load_state_dict(ck["coarse"])
             fine.load_state_dict(ck["fine"])
+            if "optimizer" in ck:
+                optimizer.load_state_dict(ck["optimizer"])
+            else:
+                print("[WARN] checkpoint has no optimizer state (old format); Adam restarts")
+            if occ is not None and "occupancy" in ck:
+                occ.load_state_dict(ck["occupancy"])
+            if "rng" in ck:
+                restore_rng(ck["rng"])
+            bad = model_config_mismatch(cfg, ck.get("config"))
+            if bad:
+                raise SystemExit(f"--resume with a different model/data config: {bad}")
+            if ck.get("config") not in (None, cfg):
+                print("[WARN] training settings differ from the checkpoint's config")
             start_step = last_step + 1
-            print(f"Resuming from iteration {start_step} (loaded  {os.path.basename(ck_path)})")
+            print(f"Resuming from step {start_step} (loaded {os.path.basename(ck_path)})")
         else:
-            print("No checkpoint_* found; starting from scratch")
+            print("No checkpoint found; starting from scratch")
+    elif numbered_checkpoints(logdir) or os.path.exists(os.path.join(logdir, LAST)):
+        raise SystemExit(f"{logdir} already has checkpoints from another run: use --resume to "
+                         "continue it, or pick a new --expname")
+    truncate_metrics(metrics_path, start_step)
 
-    # 7) training params
-    max_steps = cfg["training"]["max_steps"]
-    batch_rays = cfg["training"]["batch_rays"]
-    log_interval = cfg["training"]["log_interval"]
-    val_interval = cfg["training"]["val_interval"]
-    save_interval = cfg["training"]["save_interval"]
+    max_steps = int(tcfg["max_steps"])
+    batch_rays = int(tcfg["batch_rays"])
+    log_interval = int(tcfg["log_interval"])
+    save_interval = int(tcfg["save_interval"])
+    val_interval = int(tcfg["val_interval"])
+    keep = int(tcfg.get("keep_ckpts", 3))
 
-    # 8) main loop: start from wherever we left off
-    for step in tqdm(range(start_step, max_steps), desc="Training", leave=True):
-        # sample random rays
-        img_i = random.randrange(len(ds.images))
-        rays_o, rays_d, target = ds.get_rays(img_i)
-        # flatten and pick batch
-        H, W = ds.H, ds.W
-        rays_o = torch.from_numpy(rays_o.reshape(-1, 3).copy()).float()
-        rays_d = torch.from_numpy(rays_d.reshape(-1, 3).copy()).float()
-        target = torch.from_numpy(target.reshape(-1, 3).copy()).float()
-        idxs = torch.randint(0, H * W, (batch_rays,), dtype=torch.long)
-        rays_o, rays_d, target = rays_o[idxs], rays_d[idxs], target[idxs]
-        rays_o, rays_d, target = rays_o.to(device), rays_d.to(device), target.to(device)  # Move to GPU
+    bar_info: dict[str, str] = {}  # latest loss / PSNR / val PSNR shown on the progress bar
 
-        # render
-        rgb_coarse, rgb_fine = render_rays(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg)
+    def run_val(step: int) -> None:
+        if val_ds is None:
+            return
+        t0 = time.perf_counter()
+        counts = (occ._total.clone(), occ._skipped.clone()) if occ is not None else None
+        results = validate(cfg, val_ds, (coarse, fine, peXYZ, peDir), device, occ)
+        if occ is not None:  # keep val queries out of the training skip statistics
+            occ._total, occ._skipped = counts
+        secs = time.perf_counter() - t0
+        mean = sum(p for _, p, _ in results) / len(results)
+        writer.add_scalar("val/psnr", mean, step)
+        for name, p, _ in results:
+            writer.add_scalar(f"val/psnr_{name}", p, step)
+        writer.add_image("val/render", results[0][2], step, dataformats="HWC")
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps({"step": step, "val_psnr": mean,
+                                "val_psnr_per_view": {n: p for n, p, _ in results},
+                                "val_seconds": secs}) + "\n")
+        bar_info["val"] = f"{mean:.2f}"
+        tqdm.write(f"step {step} val/psnr {mean:.2f} dB ({secs:.1f} s)")
 
-        # loss & step
-        loss = (torch.nan_to_num((rgb_coarse - target)**2, nan=0.0).mean() + 
-                torch.nan_to_num((rgb_fine - target)**2, nan=0.0).mean())
-        optimizer.zero_grad()
+    def checkpoint(step: int) -> str:
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"non-finite loss at step {step}; not saving a checkpoint")
+        return save_checkpoint(logdir, {
+            "coarse": coarse.state_dict(),
+            "fine": fine.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            # LR is a pure function of the step; store the schedule for reference
+            "lr_state": {"lr": optimizer.param_groups[0]["lr"], "lr0": lr0,
+                         "decay_steps": lr_decay_steps, "decay_rate": lr_decay_rate},
+            "step": step,
+            "rng": capture_rng(),
+            "config": cfg,
+            "git_sha": git_sha(),
+            **({"occupancy": occ.state_dict()} if occ is not None else {}),
+        }, keep=keep)
+
+    lr0 = float(tcfg["lr"])
+    lr_decay_steps = int(tcfg.get("lr_decay_steps", 500_000))
+    lr_decay_rate = float(tcfg.get("lr_decay_rate", 0.1))
+    precrop_iters = int(tcfg.get("precrop_iters", 0))
+    precrop_frac = float(tcfg.get("precrop_frac", 0.5))
+
+    # Images and poses stay on the GPU; rays are built only for the sampled pixels.
+    H, W, focal = ds.H, ds.W, float(ds.focal)
+    images = torch.from_numpy(ds.images).to(device)  # (N, H, W, 3)
+    poses = torch.from_numpy(ds.poses).to(device)  # (N, 4, 4)
+
+    loss_val = float("nan")
+    step = start_step - 1
+    t_last, t_last_step = time.perf_counter(), start_step - 1
+    # mininterval=1 s keeps the bar readable (and the log small) when stderr goes to a file
+    pbar = tqdm(range(start_step, max_steps), desc="Training", initial=start_step,
+                total=max_steps, mininterval=1.0, dynamic_ncols=True)
+    for step in pbar:
+        img_i = random.randrange(len(images))
+        crop = precrop_frac if step < precrop_iters else None
+        i, j = sample_pixels(batch_rays, H, W, crop, device)
+        rays_o, rays_d = rays_at_pixels(i.float(), j.float(), H, W, focal, poses[img_i])
+        target = images[img_i, j, i]
+
+        if occ is not None and occ.should_update(step):
+            occ.update(coarse, peXYZ)
+        rgb_coarse, rgb_fine = render_rays(coarse_fwd, fine_fwd, peXYZ, peDir, rays_o, rays_d,
+                                           cfg, perturb=True, occ=occ)
+        mse_c = ((rgb_coarse - target) ** 2).mean()
+        mse_f = ((rgb_fine - target) ** 2).mean()
+        loss = mse_c + mse_f
+        lr = lr_at(step, lr0, lr_decay_steps, lr_decay_rate)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        # logging
-        if step % log_interval == 0:
-          writer.add_scalar("loss/train", loss.item(), step)
-          tqdm.write(f"Step {step}, Loss: {loss.item():.4f}, rgb_coarse min/max: {rgb_coarse.min().item():.4f}/{rgb_coarse.max().item():.4f}")
+        if step % log_interval == 0 or step == max_steps - 1:
+            loss_val = loss.item()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite loss {loss_val} at step {step}")
+            now = time.perf_counter()
+            ms = 1000.0 * (now - t_last) / (step - t_last_step)
+            t_last, t_last_step = now, step
+            psnr = -10.0 * torch.log10(mse_f).item()
+            psnr_c = -10.0 * torch.log10(mse_c).item()
+            mem_gib = (torch.cuda.max_memory_allocated() / 2**30
+                       if device.type == "cuda" else 0.0)
+            writer.add_scalar("mem/peak_gib", mem_gib, step)
+            writer.add_scalar("loss/train", loss_val, step)
+            writer.add_scalar("psnr/train", psnr, step)
+            writer.add_scalar("psnr/train_coarse", psnr_c, step)
+            writer.add_scalar("lr", lr, step)
+            writer.add_scalar("time/ms_per_step", ms, step)
+            rec = {"step": step, "loss": loss_val, "psnr_train": psnr,
+                   "psnr_train_coarse": psnr_c, "lr": lr,
+                   "ms_per_step": ms, "peak_mem_gib": mem_gib}
+            occ_msg = ""
+            if occ is not None:
+                rec["skipped_frac"] = occ.skipped_fraction()
+                rec["occupied_frac"] = occ.occupied_fraction()
+                occ.reset_stats()
+                writer.add_scalar("occ/skipped_frac", rec["skipped_frac"], step)
+                writer.add_scalar("occ/occupied_frac", rec["occupied_frac"], step)
+                occ_msg = f" skip {rec['skipped_frac']:.3f} occ {rec['occupied_frac']:.3f}"
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            bar_info.update(loss=f"{loss_val:.4f}", psnr=f"{psnr:.2f}", ms=f"{ms:.0f}")
+            pbar.set_postfix(bar_info, refresh=False)
+            tqdm.write(f"step {step} loss {loss_val:.5f} psnr fine {psnr:.2f} coarse {psnr_c:.2f} "
+                       f"lr {lr:.2e} "
+                       f"{ms:.1f} ms/step{occ_msg}")
 
-        # optional val & checkpoint
+        if step and step % val_interval == 0:
+            run_val(step)
+            t_last, t_last_step = time.perf_counter(), step  # keep val out of ms/step
         if step and step % save_interval == 0:
-            # include the iteration counter in every save
-            ck = {"coarse": coarse.state_dict(), "fine": fine.state_dict(), "step": step}
-            torch.save(ck, os.path.join(logdir, f"checkpoint_{step}.pth"))
-    
+            checkpoint(step)
+            t_last, t_last_step = time.perf_counter(), step  # keep saving out of ms/step
 
-    # ensure we save the very last step even if it's not on a save_interval
-    final_step = max_steps - 1
-    # only if we didn’t already save it
-    if final_step % save_interval != 0:
-        ck = {"coarse": coarse.state_dict(),
-              "fine":   fine.state_dict(),
-              "step":   final_step}
-        path = os.path.join(logdir, f"checkpoint_{final_step}.pth")
-        torch.save(ck, path)
-        print(f"[INFO] Saved final checkpoint at step {final_step}: {path}")
-            
-
+    final = max_steps - 1
+    if step == final and start_step <= final:  # not when resuming an already finished run
+        if final % val_interval != 0:
+            run_val(final)
+        if final % save_interval != 0:
+            path = checkpoint(final)
+            print(f"[INFO] Saved final checkpoint at step {final}: {path}")
     writer.close()
+    return {"step": step, "loss": loss_val, "logdir": logdir}
 
-if __name__ == "__main__":
+
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--expname", default="run1")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
+                   help="override config values, e.g. --set training.max_steps=1000 seed=1")
     args = p.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as f:
+        cfg = apply_overrides(yaml.safe_load(f), args.set)
     train(cfg, args.expname, args.resume)
+
+
+if __name__ == "__main__":
+    main()

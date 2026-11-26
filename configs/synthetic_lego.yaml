@@ -3,8 +3,15 @@ data:
   height: 400
   width: 400
   focal: AUTO
+  white_bkgd: true   # composite RGBA targets onto white (v1 used false: black background)
 
 model:
+  near: 2.0
+  far: 6.0
+  # Gaussian noise on raw density during training (NeRF paper regulariser). Without it,
+  # seed 0 collapsed: fine-MLP raw sigma < 0 everywhere -> zero ReLU gradient -> white.
+  raw_noise_std: 1.0
+  density_activation: relu   # relu (paper) | softplus
   coarse:
     n_layers: 8
     hidden_dim: 256
@@ -17,10 +24,29 @@ model:
 training:
   batch_rays: 1024
   lr: 5e-4
+  lr_decay_steps: 500000   # lr = lr * lr_decay_rate ** (step / lr_decay_steps), nerf-pytorch default
+  lr_decay_rate: 0.1
   max_steps: 300000
+  precrop_iters: 500   # sample only the image centre for the first N steps (avoids collapse)
+  precrop_frac: 0.5
   log_interval: 100
   val_interval: 5000
+  val_indices: [0, 33, 66]   # fixed val views, rendered deterministically for val/psnr
   save_interval: 3000
+  keep_ckpts: 3        # numbered checkpoints kept, plus checkpoint_last.pth
+  compile: true        # torch.compile the MLPs (fp32 math)
+  fused_adam: true     # fused CUDA Adam (fp32 math)
+
+occupancy:            # empty-space skipping (scripts/occupancy.py)
+  enabled: true      # 3.1 ablation (5k steps): 223 -> 93 ms/step, val PSNR 23.19 vs 23.19 dB
+  resolution: 128     # cells per axis
+  aabb: [[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]]   # checked with scripts/check_aabb.py
+  update_every: 16    # steps between grid updates
+  warmup_steps: 500   # first update at this step (= precrop_iters)
+  threshold: 0.01     # occupied if decayed-max opacity 1 - exp(-sigma * delta) > threshold
+  ema_decay: 0.95
+
+seed: 0
 
 render:
-  render_only: false
+  chunk_size: 4096    # rays per forward pass when rendering full images
