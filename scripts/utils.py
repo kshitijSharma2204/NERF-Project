@@ -16,6 +16,10 @@ def load_config(path: str) -> dict:
 
 
 def get_device() -> torch.device:
+    """CUDA if available; NERF_DEVICE=cpu forces CPU (used by exact-reproducibility tests)."""
+    forced = os.environ.get("NERF_DEVICE")
+    if forced:
+        return torch.device(forced)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
