@@ -3,6 +3,7 @@ data:
   height: 400
   width: 400
   focal: AUTO
+  white_bkgd: true   # composite RGBA targets onto white (v1 used false: black background)
 
 model:
   coarse:
