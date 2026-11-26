@@ -1,5 +1,6 @@
 import argparse
 import os
+import subprocess
 import time
 
 import numpy as np
@@ -62,14 +63,57 @@ def render_poses(cfg, models, poses, H, W, focal, device, outdir=None, desc="Ren
     return frames
 
 
+def pose_spherical(theta_deg: float, phi_deg: float, radius: float) -> np.ndarray:
+    """Camera-to-world matrix on a sphere around the origin (as in the original NeRF code)."""
+    th, ph = np.deg2rad(theta_deg), np.deg2rad(phi_deg)
+    trans = np.eye(4)
+    trans[2, 3] = radius
+    rot_phi = np.array([[1, 0, 0, 0], [0, np.cos(ph), -np.sin(ph), 0],
+                        [0, np.sin(ph), np.cos(ph), 0], [0, 0, 0, 1]])
+    rot_theta = np.array([[np.cos(th), 0, -np.sin(th), 0], [0, 1, 0, 0],
+                          [np.sin(th), 0, np.cos(th), 0], [0, 0, 0, 1]])
+    flip = np.array([[-1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+    return (flip @ rot_theta @ rot_phi @ trans).astype(np.float32)
+
+
+def spherical_path(n_frames: int, phi_deg: float = -30.0, radius: float = 4.0) -> np.ndarray:
+    thetas = np.linspace(-180.0, 180.0, n_frames + 1)[:-1]
+    return np.stack([pose_spherical(t, phi_deg, radius) for t in thetas])
+
+
+def encode_video(frame_dir: str, mp4_path: str, gif_path: str | None, fps: int = 30,
+                 gif_width: int = 320) -> None:
+    """MP4 (H.264) and an optional small GIF (palette, downscaled) with ffmpeg."""
+    pattern = os.path.join(frame_dir, "%03d.png")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps), "-i", pattern,
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", mp4_path], check=True)
+    if gif_path:
+        vf = (f"fps={fps // 2},scale={gif_width}:-1:flags=lanczos,split[a][b];"
+              "[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps), "-i",
+                        pattern, "-vf", vf, gif_path], check=True)
+
+
+def _check_outdir(outdir: str) -> None:
+    """Never write renders into outputs/ itself: that is where the v1 results live."""
+    if os.path.abspath(outdir) == os.path.abspath("outputs"):
+        raise SystemExit("refusing to write into outputs/ (v1 artifacts); use outputs/v2/...")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--expname", default=None, help="unused; kept for run_lego.sh compatibility")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--split", default="test")
-    p.add_argument("--outdir", default="outputs")
+    p.add_argument("--path", choices=["split", "spherical"], default="split",
+                   help="render the split's cameras, or a 360-degree fly-around")
+    p.add_argument("--n_frames", type=int, default=120)
+    p.add_argument("--video", default=None, help="with --path spherical: write this .mp4")
+    p.add_argument("--gif", default=None, help="with --video: also write this small .gif")
+    p.add_argument("--outdir", default="outputs/v2/renders")
     args = p.parse_args()
+    _check_outdir(args.outdir)
 
     configure_fp32()
     cfg = load_config(args.config)
@@ -77,8 +121,11 @@ def main() -> None:
     ds = NeRFDataset(cfg, split=args.split)
     coarse, fine, peXYZ, peDir, ck = load_models_from_ckpt(cfg, args.ckpt, device)
     occ = load_occupancy_from_ckpt(cfg, ck, device)
-    render_poses(cfg, (coarse, fine, peXYZ, peDir), ds.poses, ds.H, ds.W, ds.focal, device,
+    poses = spherical_path(args.n_frames) if args.path == "spherical" else ds.poses
+    render_poses(cfg, (coarse, fine, peXYZ, peDir), poses, ds.H, ds.W, ds.focal, device,
                  args.outdir, occ=occ)
+    if args.video:
+        encode_video(args.outdir, args.video, args.gif)
 
 
 if __name__ == "__main__":
