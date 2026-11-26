@@ -50,5 +50,6 @@ def tiny_cfg(tiny_scene):
             "fine": {"n_layers": 2, "hidden_dim": 32, "depth_samples": 8},
         },
         "training": {"batch_rays": 64, "lr": 5e-4, "max_steps": 20, "log_interval": 1,
-                     "val_interval": 1000, "save_interval": 5, "keep_ckpts": 3},
+                     "val_interval": 1000, "val_indices": [0, 1], "save_interval": 5,
+                     "keep_ckpts": 3},
     }

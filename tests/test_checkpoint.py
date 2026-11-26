@@ -18,7 +18,7 @@ from scripts.train import apply_overrides, train
 
 def _losses(logdir):
     with open(os.path.join(logdir, "metrics.jsonl")) as f:
-        return [(r["step"], r["loss"]) for r in map(json.loads, f)]
+        return [(r["step"], r["loss"]) for r in map(json.loads, f) if "loss" in r]
 
 
 def test_rng_roundtrip_through_weights_only_load(tmp_path):

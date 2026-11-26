@@ -13,8 +13,35 @@ from tqdm import tqdm
 
 from scripts.checkpoint import capture_rng, find_last_ckpt_and_step, restore_rng, save_checkpoint
 from scripts.data_loader import NeRFDataset
-from scripts.render_rays import render_rays
-from scripts.utils import build_models, configure_fp32, get_device, git_sha, set_seed
+from scripts.metrics import psnr as psnr_metric
+from scripts.render_rays import render_image, render_rays
+from scripts.utils import (
+    build_models,
+    configure_fp32,
+    get_device,
+    git_sha,
+    rays_for_pose,
+    set_seed,
+)
+
+
+def validate(cfg: dict, val_ds: NeRFDataset, models: tuple, device: torch.device) -> list[tuple]:
+    """Deterministically render the fixed val views. Returns [(name, psnr, image)]."""
+    coarse, fine, peXYZ, peDir = models
+    chunk = cfg.get("render", {}).get("chunk_size", 4096)
+    coarse.eval()
+    fine.eval()
+    out = []
+    for k in range(len(val_ds.images)):
+        c2w = torch.as_tensor(val_ds.poses[k], device=device)
+        rays_o, rays_d = rays_for_pose(val_ds.H, val_ds.W, val_ds.focal, c2w)
+        rgb = render_image(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg, chunk=chunk)
+        img = rgb.clamp(0, 1).reshape(val_ds.H, val_ds.W, 3)
+        gt = torch.as_tensor(val_ds.images[k], device=device)
+        out.append((val_ds.names[k], psnr_metric(img, gt), img))
+    coarse.train()
+    fine.train()
+    return out
 
 
 def apply_overrides(cfg: dict, overrides: list[str]) -> dict:
@@ -54,6 +81,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
     metrics_path = os.path.join(logdir, "metrics.jsonl")
 
     ds = NeRFDataset(cfg, split="train")
+    val_indices = list(tcfg.get("val_indices", [0, 33, 66]))
+    val_ds = NeRFDataset(cfg, split="val", indices=val_indices) if val_indices else None
     coarse, fine, peXYZ, peDir = build_models(cfg, device)
     params = list(coarse.parameters()) + list(fine.parameters())
     optimizer = torch.optim.Adam(params, lr=float(tcfg["lr"]))
@@ -82,7 +111,25 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
     batch_rays = int(tcfg["batch_rays"])
     log_interval = int(tcfg["log_interval"])
     save_interval = int(tcfg["save_interval"])
+    val_interval = int(tcfg["val_interval"])
     keep = int(tcfg.get("keep_ckpts", 3))
+
+    def run_val(step: int) -> None:
+        if val_ds is None:
+            return
+        t0 = time.perf_counter()
+        results = validate(cfg, val_ds, (coarse, fine, peXYZ, peDir), device)
+        secs = time.perf_counter() - t0
+        mean = sum(p for _, p, _ in results) / len(results)
+        writer.add_scalar("val/psnr", mean, step)
+        for name, p, _ in results:
+            writer.add_scalar(f"val/psnr_{name}", p, step)
+        writer.add_image("val/render", results[0][2], step, dataformats="HWC")
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps({"step": step, "val_psnr": mean,
+                                "val_psnr_per_view": {n: p for n, p, _ in results},
+                                "val_seconds": secs}) + "\n")
+        tqdm.write(f"step {step} val/psnr {mean:.2f} dB ({secs:.1f} s)")
 
     def checkpoint(step: int) -> str:
         return save_checkpoint(logdir, {
@@ -139,13 +186,19 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             tqdm.write(f"step {step} loss {loss_val:.5f} psnr {psnr:.2f} lr {lr:.2e} "
                        f"{ms:.1f} ms/step")
 
+        if step and step % val_interval == 0:
+            run_val(step)
+            t_last = time.perf_counter()  # keep validation out of ms/step
         if step and step % save_interval == 0:
             checkpoint(step)
 
     final = max_steps - 1
-    if step == final and final % save_interval != 0:
-        path = checkpoint(final)
-        print(f"[INFO] Saved final checkpoint at step {final}: {path}")
+    if step == final:
+        if final % val_interval != 0:
+            run_val(final)
+        if final % save_interval != 0:
+            path = checkpoint(final)
+            print(f"[INFO] Saved final checkpoint at step {final}: {path}")
     writer.close()
     return {"step": step, "loss": loss_val, "logdir": logdir}
 
