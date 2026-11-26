@@ -38,7 +38,7 @@ training:
   fused_adam: true     # fused CUDA Adam (fp32 math)
 
 occupancy:            # empty-space skipping (scripts/occupancy.py)
-  enabled: false
+  enabled: true      # 3.1 ablation (5k steps): 223 -> 93 ms/step, val PSNR 23.19 vs 23.19 dB
   resolution: 128     # cells per axis
   aabb: [[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]]   # checked with scripts/check_aabb.py
   update_every: 16    # steps between grid updates
