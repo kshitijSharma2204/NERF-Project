@@ -20,9 +20,27 @@ from scripts.utils import (
     configure_fp32,
     get_device,
     git_sha,
+    rays_at_pixels,
     rays_for_pose,
     set_seed,
 )
+
+
+def sample_pixels(
+    n: int, H: int, W: int, crop_frac: float | None, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random pixel (column i, row j) indices; only the central crop_frac region if given.
+
+    Matches nerf-pytorch's precrop: rows in [H/2 - dH, H/2 + dH) with dH = H/2 * frac.
+    """
+    if crop_frac is not None:
+        dH, dW = int(H // 2 * crop_frac), int(W // 2 * crop_frac)
+        j = torch.randint(H // 2 - dH, H // 2 + dH, (n,), device=device)
+        i = torch.randint(W // 2 - dW, W // 2 + dW, (n,), device=device)
+    else:
+        j = torch.randint(0, H, (n,), device=device)
+        i = torch.randint(0, W, (n,), device=device)
+    return i, j
 
 
 def validate(cfg: dict, val_ds: NeRFDataset, models: tuple, device: torch.device) -> list[tuple]:
@@ -143,20 +161,24 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             "git_sha": git_sha(),
         }, keep=keep)
 
-    H, W = ds.H, ds.W
+    precrop_iters = int(tcfg.get("precrop_iters", 0))
+    precrop_frac = float(tcfg.get("precrop_frac", 0.5))
+
+    # Images and poses stay on the GPU; rays are built only for the sampled pixels.
+    H, W, focal = ds.H, ds.W, float(ds.focal)
+    images = torch.from_numpy(ds.images).to(device)  # (N, H, W, 3)
+    poses = torch.from_numpy(ds.poses).to(device)  # (N, 4, 4)
+
     loss_val = float("nan")
     step = start_step - 1
     t_last = time.perf_counter()
     for step in tqdm(range(start_step, max_steps), desc="Training", initial=start_step,
                      total=max_steps):
-        img_i = random.randrange(len(ds.images))
-        rays_o, rays_d, target = ds.get_rays(img_i)
-        rays_o = torch.from_numpy(rays_o.reshape(-1, 3).copy()).float()
-        rays_d = torch.from_numpy(rays_d.reshape(-1, 3).copy()).float()
-        target = torch.from_numpy(target.reshape(-1, 3).copy()).float()
-        idxs = torch.randint(0, H * W, (batch_rays,), dtype=torch.long)
-        rays_o, rays_d, target = rays_o[idxs], rays_d[idxs], target[idxs]
-        rays_o, rays_d, target = rays_o.to(device), rays_d.to(device), target.to(device)
+        img_i = random.randrange(len(images))
+        crop = precrop_frac if step < precrop_iters else None
+        i, j = sample_pixels(batch_rays, H, W, crop, device)
+        rays_o, rays_d = rays_at_pixels(i.float(), j.float(), H, W, focal, poses[img_i])
+        target = images[img_i, j, i]
 
         rgb_coarse, rgb_fine = render_rays(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg,
                                            perturb=True)

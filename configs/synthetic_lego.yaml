@@ -19,6 +19,8 @@ training:
   batch_rays: 1024
   lr: 5e-4
   max_steps: 300000
+  precrop_iters: 500   # sample only the image centre for the first N steps (avoids collapse)
+  precrop_frac: 0.5
   log_interval: 100
   val_interval: 5000
   val_indices: [0, 33, 66]   # fixed val views, rendered deterministically for val/psnr
