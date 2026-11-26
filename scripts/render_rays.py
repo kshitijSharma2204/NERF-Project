@@ -49,13 +49,28 @@ def sample_pdf(
     return samples
 
 
-def _query(model, peXYZ, peDir, pts: torch.Tensor, rays_d: torch.Tensor):
-    """Run the MLP on points pts (B,N,3) along rays with directions rays_d (B,3)."""
+def _query(model, peXYZ, peDir, pts: torch.Tensor, rays_d: torch.Tensor, occ=None):
+    """Run the MLP on points pts (B,N,3) along rays with directions rays_d (B,3).
+
+    With an occupancy grid, only samples in occupied cells go through the MLP; the
+    others get sigma = 0 and rgb = 0 (they contribute nothing to the render).
+    """
     B, N = pts.shape[:2]
-    emb_pts = peXYZ(pts.reshape(-1, 3))
-    emb_dirs = peDir(rays_d)
-    emb_dirs = emb_dirs.unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
-    rgb, sigma = model(emb_pts, emb_dirs)
+    if occ is None:
+        emb_pts = peXYZ(pts.reshape(-1, 3))
+        emb_dirs = peDir(rays_d).unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
+        rgb, sigma = model(emb_pts, emb_dirs)
+        return rgb.reshape(B, N, 3), sigma.reshape(B, N)
+
+    keep = occ.query(pts).reshape(-1).nonzero().squeeze(-1)  # flat sample ids
+    rgb = pts.new_zeros(B * N, 3)
+    sigma = pts.new_zeros(B * N)
+    if keep.numel() > 0:
+        emb_pts = peXYZ(pts.reshape(-1, 3)[keep])
+        emb_dirs = peDir(rays_d)[keep // N]
+        rgb_k, sigma_k = model(emb_pts, emb_dirs)
+        rgb = rgb.index_put((keep,), rgb_k)
+        sigma = sigma.index_put((keep,), sigma_k.squeeze(-1))
     return rgb.reshape(B, N, 3), sigma.reshape(B, N)
 
 
@@ -68,12 +83,14 @@ def render_rays(
     rays_d: torch.Tensor,
     cfg: dict,
     perturb: bool = True,
+    occ=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render a batch of rays (B,3) with the coarse and fine models.
 
     perturb=True (training): stratified jitter of coarse depths and random
     inverse-CDF fine samples. perturb=False (render/eval): coarse samples at bin
     edges and deterministic fine samples, so the same view renders identically.
+    occ: optional OccupancyGrid; coarse and fine samples in empty cells are skipped.
     """
     device = rays_o.device
     B = rays_o.shape[0]
@@ -92,7 +109,7 @@ def render_rays(
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals.unsqueeze(-1)
-    rgb_c, sigma_c = _query(coarse_model, peXYZ, peDir, pts, rays_d)
+    rgb_c, sigma_c = _query(coarse_model, peXYZ, peDir, pts, rays_d, occ)
     rgb_coarse, weights = raw2outputs(rgb_c, sigma_c, z_vals, rays_d, white_bkgd=True)
 
     # Fine sampling (importance sampling from coarse weights; no gradient through it)
@@ -101,7 +118,7 @@ def render_rays(
     z_vals_all, _ = torch.sort(torch.cat([z_vals, z_samples.detach()], -1), -1)
 
     pts_f = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals_all.unsqueeze(-1)
-    rgb_f, sigma_f = _query(fine_model, peXYZ, peDir, pts_f, rays_d)
+    rgb_f, sigma_f = _query(fine_model, peXYZ, peDir, pts_f, rays_d, occ)
     rgb_fine, _ = raw2outputs(rgb_f, sigma_f, z_vals_all, rays_d, white_bkgd=True)
 
     return rgb_coarse, rgb_fine
@@ -117,6 +134,7 @@ def render_image(
     rays_d: torch.Tensor,
     cfg: dict,
     chunk: int = 4096,
+    occ=None,
 ) -> torch.Tensor:
     """Deterministically render flattened rays (R,3) in chunks; returns fine RGB (R,3)."""
     out = []
@@ -124,6 +142,7 @@ def render_image(
         _, rgb = render_rays(
             coarse_model, fine_model, peXYZ, peDir,
             rays_o[start:start + chunk], rays_d[start:start + chunk], cfg, perturb=False,
+            occ=occ,
         )
         out.append(rgb)
     return torch.cat(out, 0)

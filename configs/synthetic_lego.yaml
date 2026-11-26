@@ -6,6 +6,8 @@ data:
   white_bkgd: true   # composite RGBA targets onto white (v1 used false: black background)
 
 model:
+  near: 2.0
+  far: 6.0
   coarse:
     n_layers: 8
     hidden_dim: 256
@@ -30,6 +32,15 @@ training:
   keep_ckpts: 3        # numbered checkpoints kept, plus checkpoint_last.pth
   compile: true        # torch.compile the MLPs (fp32 math)
   fused_adam: true     # fused CUDA Adam (fp32 math)
+
+occupancy:            # empty-space skipping (scripts/occupancy.py)
+  enabled: false
+  resolution: 128     # cells per axis
+  aabb: [[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]]   # checked with scripts/check_aabb.py
+  update_every: 16    # steps between grid updates
+  warmup_steps: 500   # first update at this step (= precrop_iters)
+  threshold: 0.01     # occupied if decayed-max opacity 1 - exp(-sigma * delta) > threshold
+  ema_decay: 0.95
 
 seed: 0
 

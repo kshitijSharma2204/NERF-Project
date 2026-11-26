@@ -14,6 +14,7 @@ from tqdm import tqdm
 from scripts.checkpoint import capture_rng, find_last_ckpt_and_step, restore_rng, save_checkpoint
 from scripts.data_loader import NeRFDataset
 from scripts.metrics import psnr as psnr_metric
+from scripts.occupancy import build_occupancy
 from scripts.render_rays import render_image, render_rays
 from scripts.utils import (
     build_models,
@@ -48,7 +49,8 @@ def sample_pixels(
     return i, j
 
 
-def validate(cfg: dict, val_ds: NeRFDataset, models: tuple, device: torch.device) -> list[tuple]:
+def validate(cfg: dict, val_ds: NeRFDataset, models: tuple, device: torch.device,
+             occ=None) -> list[tuple]:
     """Deterministically render the fixed val views. Returns [(name, psnr, image)]."""
     coarse, fine, peXYZ, peDir = models
     chunk = cfg.get("render", {}).get("chunk_size", 4096)
@@ -58,7 +60,8 @@ def validate(cfg: dict, val_ds: NeRFDataset, models: tuple, device: torch.device
     for k in range(len(val_ds.images)):
         c2w = torch.as_tensor(val_ds.poses[k], device=device)
         rays_o, rays_d = rays_for_pose(val_ds.H, val_ds.W, val_ds.focal, c2w)
-        rgb = render_image(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg, chunk=chunk)
+        rgb = render_image(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg, chunk=chunk,
+                           occ=occ)
         img = rgb.clamp(0, 1).reshape(val_ds.H, val_ds.W, 3)
         gt = torch.as_tensor(val_ds.images[k], device=device)
         out.append((val_ds.names[k], psnr_metric(img, gt), img))
@@ -115,6 +118,7 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
         coarse_fwd, fine_fwd = torch.compile(coarse), torch.compile(fine)
     else:
         coarse_fwd, fine_fwd = coarse, fine
+    occ = build_occupancy(cfg, device)
 
     start_step = 0
     if resume:
@@ -126,6 +130,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
                 optimizer.load_state_dict(ck["optimizer"])
             else:
                 print("[WARN] checkpoint has no optimizer state (old format); Adam restarts")
+            if occ is not None and "occupancy" in ck:
+                occ.load_state_dict(ck["occupancy"])
             if "rng" in ck:
                 restore_rng(ck["rng"])
             if ck.get("config") not in (None, cfg):
@@ -147,7 +153,10 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
         if val_ds is None:
             return
         t0 = time.perf_counter()
-        results = validate(cfg, val_ds, (coarse, fine, peXYZ, peDir), device)
+        counts = (occ._total.clone(), occ._skipped.clone()) if occ is not None else None
+        results = validate(cfg, val_ds, (coarse, fine, peXYZ, peDir), device, occ)
+        if occ is not None:  # keep val queries out of the training skip statistics
+            occ._total, occ._skipped = counts
         secs = time.perf_counter() - t0
         mean = sum(p for _, p, _ in results) / len(results)
         writer.add_scalar("val/psnr", mean, step)
@@ -172,6 +181,7 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             "rng": capture_rng(),
             "config": cfg,
             "git_sha": git_sha(),
+            **({"occupancy": occ.state_dict()} if occ is not None else {}),
         }, keep=keep)
 
     lr0 = float(tcfg["lr"])
@@ -196,8 +206,10 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
         rays_o, rays_d = rays_at_pixels(i.float(), j.float(), H, W, focal, poses[img_i])
         target = images[img_i, j, i]
 
+        if occ is not None and occ.should_update(step):
+            occ.update(coarse, peXYZ)
         rgb_coarse, rgb_fine = render_rays(coarse_fwd, fine_fwd, peXYZ, peDir, rays_o, rays_d,
-                                           cfg, perturb=True)
+                                           cfg, perturb=True, occ=occ)
         mse_f = ((rgb_fine - target) ** 2).mean()
         loss = ((rgb_coarse - target) ** 2).mean() + mse_f
         lr = lr_at(step, lr0, lr_decay_steps, lr_decay_rate)
@@ -223,12 +235,20 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             writer.add_scalar("psnr/train", psnr, step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("time/ms_per_step", ms, step)
+            rec = {"step": step, "loss": loss_val, "psnr_train": psnr, "lr": lr,
+                   "ms_per_step": ms, "peak_mem_gib": mem_gib}
+            occ_msg = ""
+            if occ is not None:
+                rec["skipped_frac"] = occ.skipped_fraction()
+                rec["occupied_frac"] = occ.occupied_fraction()
+                occ.reset_stats()
+                writer.add_scalar("occ/skipped_frac", rec["skipped_frac"], step)
+                writer.add_scalar("occ/occupied_frac", rec["occupied_frac"], step)
+                occ_msg = f" skip {rec['skipped_frac']:.3f} occ {rec['occupied_frac']:.3f}"
             with open(metrics_path, "a") as f:
-                f.write(json.dumps({"step": step, "loss": loss_val, "psnr_train": psnr,
-                                    "lr": lr, "ms_per_step": ms,
-                                    "peak_mem_gib": mem_gib}) + "\n")
+                f.write(json.dumps(rec) + "\n")
             tqdm.write(f"step {step} loss {loss_val:.5f} psnr {psnr:.2f} lr {lr:.2e} "
-                       f"{ms:.1f} ms/step")
+                       f"{ms:.1f} ms/step{occ_msg}")
 
         if step and step % val_interval == 0:
             run_val(step)
