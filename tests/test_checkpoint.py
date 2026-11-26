@@ -64,7 +64,7 @@ def test_resume_reproduces_uninterrupted_run_on_cpu(tiny_cfg, tmp_path, monkeypa
     train(copy.deepcopy(tiny_cfg), "split", resume=True, logroot=logroot)
 
     full, split = _losses(f"{logroot}/full"), _losses(f"{logroot}/split")
-    assert [s for s, _ in split] == list(range(20))
+    assert [s for s, _ in split] == list(range(20))  # log_interval=1
     assert split == full  # bit-identical loss curve on CPU
 
 

@@ -197,7 +197,7 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
 
     loss_val = float("nan")
     step = start_step - 1
-    t_last = time.perf_counter()
+    t_last, t_last_step = time.perf_counter(), start_step - 1
     for step in tqdm(range(start_step, max_steps), desc="Training", initial=start_step,
                      total=max_steps):
         img_i = random.randrange(len(images))
@@ -220,14 +220,13 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
         loss.backward()
         optimizer.step()
 
-        if step % log_interval == 0:
+        if step % log_interval == 0 or step == max_steps - 1:
             loss_val = loss.item()
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite loss {loss_val} at step {step}")
             now = time.perf_counter()
-            n = log_interval if step > start_step else 1
-            ms = 1000.0 * (now - t_last) / n
-            t_last = now
+            ms = 1000.0 * (now - t_last) / (step - t_last_step)
+            t_last, t_last_step = now, step
             psnr = -10.0 * torch.log10(mse_f).item()
             psnr_c = -10.0 * torch.log10(mse_c).item()
             mem_gib = (torch.cuda.max_memory_allocated() / 2**30
@@ -257,7 +256,7 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
 
         if step and step % val_interval == 0:
             run_val(step)
-            t_last = time.perf_counter()  # keep validation out of ms/step
+            t_last, t_last_step = time.perf_counter(), step  # keep val out of ms/step
         if step and step % save_interval == 0:
             checkpoint(step)
 
