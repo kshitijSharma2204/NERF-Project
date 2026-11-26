@@ -26,6 +26,11 @@ from scripts.utils import (
 )
 
 
+def lr_at(step: int, lr0: float, decay_steps: int, decay_rate: float = 0.1) -> float:
+    """Original NeRF schedule: lr0 * decay_rate ** (step / decay_steps)."""
+    return lr0 * decay_rate ** (step / decay_steps)
+
+
 def sample_pixels(
     n: int, H: int, W: int, crop_frac: float | None, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -154,13 +159,18 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             "coarse": coarse.state_dict(),
             "fine": fine.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "lr_state": {"lr": optimizer.param_groups[0]["lr"]},
+            # LR is a pure function of the step; store the schedule for reference
+            "lr_state": {"lr": optimizer.param_groups[0]["lr"], "lr0": lr0,
+                         "decay_steps": lr_decay_steps, "decay_rate": lr_decay_rate},
             "step": step,
             "rng": capture_rng(),
             "config": cfg,
             "git_sha": git_sha(),
         }, keep=keep)
 
+    lr0 = float(tcfg["lr"])
+    lr_decay_steps = int(tcfg.get("lr_decay_steps", 500_000))
+    lr_decay_rate = float(tcfg.get("lr_decay_rate", 0.1))
     precrop_iters = int(tcfg.get("precrop_iters", 0))
     precrop_frac = float(tcfg.get("precrop_frac", 0.5))
 
@@ -184,6 +194,9 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
                                            perturb=True)
         mse_f = ((rgb_fine - target) ** 2).mean()
         loss = ((rgb_coarse - target) ** 2).mean() + mse_f
+        lr = lr_at(step, lr0, lr_decay_steps, lr_decay_rate)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -197,7 +210,6 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             ms = 1000.0 * (now - t_last) / n
             t_last = now
             psnr = -10.0 * torch.log10(mse_f).item()
-            lr = optimizer.param_groups[0]["lr"]
             writer.add_scalar("loss/train", loss_val, step)
             writer.add_scalar("psnr/train", psnr, step)
             writer.add_scalar("lr", lr, step)

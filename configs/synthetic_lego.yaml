@@ -18,6 +18,8 @@ model:
 training:
   batch_rays: 1024
   lr: 5e-4
+  lr_decay_steps: 500000   # lr = lr * lr_decay_rate ** (step / lr_decay_steps), nerf-pytorch default
+  lr_decay_rate: 0.1
   max_steps: 300000
   precrop_iters: 500   # sample only the image centre for the first N steps (avoids collapse)
   precrop_frac: 0.5
