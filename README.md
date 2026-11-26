@@ -81,10 +81,28 @@ paper (800×800, white background, all 200 test views) or to v2 below.
 
 ### v2 (improved code, RTX 3060 Laptop, fp32)
 
-*Pending the full training run.* The numbers will be the mean ± std PSNR/SSIM over **all 200
-test views** at 400×400 on a **white** background, from `scripts/evaluate.py`. They will
-appear here and in [docs/RESULTS.md](docs/RESULTS.md) together with the step count,
-wall-clock training time and commit SHA.
+| Metric (all 200 test views) | Mean ± std | Min | Max |
+|---|---|---|---|
+| PSNR | **31.20 ± 1.35 dB** | 27.73 dB | 33.40 dB |
+| SSIM | **0.9615 ± 0.0051** | 0.9469 | 0.9729 |
+
+- **Protocol:** 400×400, **white** background, deterministic rendering, scored on the 8-bit
+  renders by `scripts/evaluate.py` (`outputs/v2/eval/metrics.json`, `per_view.csv`).
+- **Training:** 200,000 steps in 7 h 28 min of wall-clock time (including validations and
+  checkpoint saves) on an RTX 3060 Laptop GPU, fp32. About 130 ms/step, with a peak of 2.97 GiB
+  of GPU memory.
+- **Commit:** `5df01d3`. Command: `./run_lego.sh training.max_steps=200000`.
+- **Val PSNR:** 24.53 dB at 10k steps, 29.65 at 100k and 31.46 at 199,999.
+
+Exact values, the full protocol and the media list are in [docs/RESULTS.md](docs/RESULTS.md).
+These numbers are not comparable to v1's: v2 uses all 200 views and a white background.
+
+| Test r_150 | Test r_162 | Test r_178 | Test r_193 |
+|---|---|---|---|
+| ![150](outputs/v2/test/150.png) | ![162](outputs/v2/test/162.png) | ![178](outputs/v2/test/178.png) | ![193](outputs/v2/test/193.png) |
+| 32.67 dB | 33.12 dB | 30.53 dB | 31.33 dB |
+
+![v2 fly-around](outputs/v2/video.gif) ([MP4](outputs/v2/video.mp4))
 
 ### What changed from v1 to v2
 
