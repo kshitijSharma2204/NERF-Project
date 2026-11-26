@@ -53,6 +53,28 @@ def test_perturbed_training_render_is_random(tmp_path):
     assert not torch.equal(a, b)
 
 
+def test_raw_noise_only_perturbs_training_renders(tmp_path):
+    set_seed(0)
+    cfg = {**CFG, "model": {**CFG["model"], "raw_noise_std": 1.0}}
+    coarse, fine, peXYZ, peDir = build_models(cfg, torch.device("cpu"))
+    rays_o, rays_d = rays_for_pose(6, 6, 8.0, POSE)
+    a = render_image(coarse, fine, peXYZ, peDir, rays_o, rays_d, cfg)
+    b = render_image(coarse, fine, peXYZ, peDir, rays_o, rays_d, CFG)
+    assert torch.equal(a, b)  # eval path ignores raw_noise_std
+
+
+def test_softplus_density_keeps_gradient_for_negative_raw():
+    from models.nerf import NeRFMLP
+    m = NeRFMLP(2, 8, 3, 3, density_activation="softplus")
+    raw = torch.full((4, 1), -0.5, requires_grad=True)
+    m._activate(raw).sum().backward()
+    assert (raw.grad > 0).all()
+    relu = NeRFMLP(2, 8, 3, 3)
+    raw2 = torch.full((4, 1), -0.5, requires_grad=True)
+    relu._activate(raw2).sum().backward()
+    assert (raw2.grad == 0).all()  # the dead-ReLU case that collapses the fine MLP
+
+
 def test_spherical_path_orbits_and_looks_at_origin():
     poses = spherical_path(8, phi_deg=-30.0, radius=4.0)
     assert poses.shape == (8, 4, 4)

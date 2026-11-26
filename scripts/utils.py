@@ -61,8 +61,11 @@ def build_models(cfg: dict, device: torch.device):
     input_ch_dir = 3 + 2 * 3 * dir_freqs
     c_cfg = cfg["model"]["coarse"]
     f_cfg = cfg["model"]["fine"]
-    coarse = NeRFMLP(c_cfg["n_layers"], c_cfg["hidden_dim"], input_ch, input_ch_dir).to(device)
-    fine = NeRFMLP(f_cfg["n_layers"], f_cfg["hidden_dim"], input_ch, input_ch_dir).to(device)
+    act = cfg["model"].get("density_activation", "relu")
+    coarse = NeRFMLP(c_cfg["n_layers"], c_cfg["hidden_dim"], input_ch, input_ch_dir,
+                     density_activation=act).to(device)
+    fine = NeRFMLP(f_cfg["n_layers"], f_cfg["hidden_dim"], input_ch, input_ch_dir,
+                   density_activation=act).to(device)
     return coarse, fine, peXYZ, peDir
 
 

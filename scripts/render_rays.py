@@ -49,7 +49,8 @@ def sample_pdf(
     return samples
 
 
-def _query(model, peXYZ, peDir, pts: torch.Tensor, rays_d: torch.Tensor, occ=None):
+def _query(model, peXYZ, peDir, pts: torch.Tensor, rays_d: torch.Tensor, occ=None,
+           noise_std: float = 0.0):
     """Run the MLP on points pts (B,N,3) along rays with directions rays_d (B,3).
 
     With an occupancy grid, only samples in occupied cells go through the MLP; the
@@ -59,7 +60,7 @@ def _query(model, peXYZ, peDir, pts: torch.Tensor, rays_d: torch.Tensor, occ=Non
     if occ is None:
         emb_pts = peXYZ(pts.reshape(-1, 3))
         emb_dirs = peDir(rays_d).unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
-        rgb, sigma = model(emb_pts, emb_dirs)
+        rgb, sigma = model(emb_pts, emb_dirs, noise_std)
         return rgb.reshape(B, N, 3), sigma.reshape(B, N)
 
     keep = occ.query(pts).reshape(-1).nonzero().squeeze(-1)  # flat sample ids
@@ -68,7 +69,7 @@ def _query(model, peXYZ, peDir, pts: torch.Tensor, rays_d: torch.Tensor, occ=Non
     if keep.numel() > 0:
         emb_pts = peXYZ(pts.reshape(-1, 3)[keep])
         emb_dirs = peDir(rays_d)[keep // N]
-        rgb_k, sigma_k = model(emb_pts, emb_dirs)
+        rgb_k, sigma_k = model(emb_pts, emb_dirs, noise_std)
         rgb = rgb.index_put((keep,), rgb_k)
         sigma = sigma.index_put((keep,), sigma_k.squeeze(-1))
     return rgb.reshape(B, N, 3), sigma.reshape(B, N)
@@ -98,6 +99,7 @@ def render_rays(
     n_fine = cfg["model"]["fine"]["depth_samples"]
     near = cfg["model"].get("near", 2.0)
     far = cfg["model"].get("far", 6.0)
+    noise = float(cfg["model"].get("raw_noise_std", 0.0)) if perturb else 0.0
 
     # Coarse sampling: evenly spaced, stratified jitter when perturbing
     z_vals = torch.linspace(near, far, n_coarse, device=device).unsqueeze(0).expand(B, -1)
@@ -109,7 +111,7 @@ def render_rays(
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals.unsqueeze(-1)
-    rgb_c, sigma_c = _query(coarse_model, peXYZ, peDir, pts, rays_d, occ)
+    rgb_c, sigma_c = _query(coarse_model, peXYZ, peDir, pts, rays_d, occ, noise)
     rgb_coarse, weights = raw2outputs(rgb_c, sigma_c, z_vals, rays_d, white_bkgd=True)
 
     # Fine sampling (importance sampling from coarse weights; no gradient through it)
@@ -118,7 +120,7 @@ def render_rays(
     z_vals_all, _ = torch.sort(torch.cat([z_vals, z_samples.detach()], -1), -1)
 
     pts_f = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals_all.unsqueeze(-1)
-    rgb_f, sigma_f = _query(fine_model, peXYZ, peDir, pts_f, rays_d, occ)
+    rgb_f, sigma_f = _query(fine_model, peXYZ, peDir, pts_f, rays_d, occ, noise)
     rgb_fine, _ = raw2outputs(rgb_f, sigma_f, z_vals_all, rays_d, white_bkgd=True)
 
     return rgb_coarse, rgb_fine
