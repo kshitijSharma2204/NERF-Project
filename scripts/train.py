@@ -177,6 +177,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
     val_interval = int(tcfg["val_interval"])
     keep = int(tcfg.get("keep_ckpts", 3))
 
+    bar_info: dict[str, str] = {}  # latest loss / PSNR / val PSNR shown on the progress bar
+
     def run_val(step: int) -> None:
         if val_ds is None:
             return
@@ -195,6 +197,7 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             f.write(json.dumps({"step": step, "val_psnr": mean,
                                 "val_psnr_per_view": {n: p for n, p, _ in results},
                                 "val_seconds": secs}) + "\n")
+        bar_info["val"] = f"{mean:.2f}"
         tqdm.write(f"step {step} val/psnr {mean:.2f} dB ({secs:.1f} s)")
 
     def checkpoint(step: int) -> str:
@@ -228,8 +231,10 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
     loss_val = float("nan")
     step = start_step - 1
     t_last, t_last_step = time.perf_counter(), start_step - 1
-    for step in tqdm(range(start_step, max_steps), desc="Training", initial=start_step,
-                     total=max_steps):
+    # mininterval=1 s keeps the bar readable (and the log small) when stderr goes to a file
+    pbar = tqdm(range(start_step, max_steps), desc="Training", initial=start_step,
+                total=max_steps, mininterval=1.0, dynamic_ncols=True)
+    for step in pbar:
         img_i = random.randrange(len(images))
         crop = precrop_frac if step < precrop_iters else None
         i, j = sample_pixels(batch_rays, H, W, crop, device)
@@ -280,6 +285,8 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
                 occ_msg = f" skip {rec['skipped_frac']:.3f} occ {rec['occupied_frac']:.3f}"
             with open(metrics_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
+            bar_info.update(loss=f"{loss_val:.4f}", psnr=f"{psnr:.2f}", ms=f"{ms:.0f}")
+            pbar.set_postfix(bar_info, refresh=False)
             tqdm.write(f"step {step} loss {loss_val:.5f} psnr fine {psnr:.2f} coarse {psnr_c:.2f} "
                        f"lr {lr:.2e} "
                        f"{ms:.1f} ms/step{occ_msg}")

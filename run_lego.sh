@@ -2,6 +2,7 @@
 # v2 pipeline: train (resumable), evaluate all 200 test views, render the fly-around.
 # Usage: ./run_lego.sh [extra --set overrides for training, e.g. training.max_steps=200000]
 set -euo pipefail
+export PYTHONUNBUFFERED=1   # step lines appear live when output goes to a log file
 
 PY=${PY:-.venv/bin/python}
 CONFIG=${CONFIG:-configs/synthetic_lego.yaml}
