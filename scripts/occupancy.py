@@ -93,5 +93,9 @@ def build_occupancy(cfg: dict, device: torch.device) -> OccupancyGrid | None:
     if not occ_cfg.get("enabled", False):
         return None
     m = cfg["model"]
+    # delta is the coarse spacing in ray parameter t. Blender ray directions are not unit
+    # length (|d| ~ 1.0-1.4), so the true metric spacing is up to ~1.4x larger: the grid's
+    # alpha underestimates the renderer's by up to ~30%, i.e. it marks cells empty slightly
+    # more readily than `threshold` suggests. Same in training and evaluation.
     delta = (m.get("far", 6.0) - m.get("near", 2.0)) / m["coarse"]["depth_samples"]
     return OccupancyGrid(occ_cfg, delta, device)

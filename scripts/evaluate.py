@@ -55,8 +55,10 @@ def evaluate(cfg: dict, ckpt_path: str, outdir: str, split: str = "test",
     coarse, fine, peXYZ, peDir, ck = load_models_from_ckpt(cfg, ckpt_path, device)
     occ = load_occupancy_from_ckpt(cfg, ck, device)
 
-    render_dir = os.path.join(outdir, split)
-    eval_dir = os.path.join(outdir, "eval")
+    # a --limit smoke test must never overwrite the full evaluation
+    suffix = f"_first{limit}" if limit is not None else ""
+    render_dir = os.path.join(outdir, split + suffix)
+    eval_dir = os.path.join(outdir, "eval" + suffix)
     os.makedirs(eval_dir, exist_ok=True)
     names = [f"{k:03d}" for k in ds.indices]
     frames = render_poses(cfg, (coarse, fine, peXYZ, peDir), ds.poses, ds.H, ds.W, ds.focal,

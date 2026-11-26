@@ -28,6 +28,7 @@ from scripts.utils import (
     configure_fp32,
     get_device,
     git_sha,
+    model_config_mismatch,
     rays_at_pixels,
     rays_for_pose,
     set_seed,
@@ -155,8 +156,11 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
                 occ.load_state_dict(ck["occupancy"])
             if "rng" in ck:
                 restore_rng(ck["rng"])
+            bad = model_config_mismatch(cfg, ck.get("config"))
+            if bad:
+                raise SystemExit(f"--resume with a different model/data config: {bad}")
             if ck.get("config") not in (None, cfg):
-                print("[WARN] config differs from the one stored in the checkpoint")
+                print("[WARN] training settings differ from the checkpoint's config")
             start_step = last_step + 1
             print(f"Resuming from step {start_step} (loaded {os.path.basename(ck_path)})")
         else:
@@ -285,9 +289,10 @@ def train(cfg: dict, expname: str, resume: bool, logroot: str = "logs") -> dict:
             t_last, t_last_step = time.perf_counter(), step  # keep val out of ms/step
         if step and step % save_interval == 0:
             checkpoint(step)
+            t_last, t_last_step = time.perf_counter(), step  # keep saving out of ms/step
 
     final = max_steps - 1
-    if step == final:
+    if step == final and start_step <= final:  # not when resuming an already finished run
         if final % val_interval != 0:
             run_val(final)
         if final % save_interval != 0:

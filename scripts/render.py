@@ -11,12 +11,23 @@ from tqdm import tqdm
 from scripts.data_loader import NeRFDataset
 from scripts.occupancy import OccupancyGrid
 from scripts.render_rays import render_image
-from scripts.utils import build_models, configure_fp32, get_device, load_config, rays_for_pose
+from scripts.utils import (
+    build_models,
+    configure_fp32,
+    get_device,
+    load_config,
+    model_config_mismatch,
+    rays_for_pose,
+)
 
 
 def load_models_from_ckpt(cfg: dict, ckpt_path: str, device: torch.device):
     coarse, fine, peXYZ, peDir = build_models(cfg, device)
     ck = torch.load(ckpt_path, map_location=device, weights_only=True)
+    bad = model_config_mismatch(cfg, ck.get("config"))
+    if bad:
+        raise SystemExit(f"config differs from the checkpoint's in {bad}; render with the "
+                         "config the model was trained with")
     coarse.load_state_dict(ck["coarse"])
     fine.load_state_dict(ck["fine"])
     coarse.eval()

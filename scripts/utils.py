@@ -50,6 +50,26 @@ def git_sha() -> str:
         return "unknown"
 
 
+# Config sections that change what a trained model renders (not how long it trains).
+MODEL_KEYS = ("model", "data", "occupancy.aabb", "occupancy.resolution")
+
+
+def _get(cfg: dict, dotted: str):
+    node = cfg
+    for k in dotted.split("."):
+        if not isinstance(node, dict) or k not in node:
+            return None
+        node = node[k]
+    return node
+
+
+def model_config_mismatch(cfg: dict, stored: dict | None) -> list[str]:
+    """Model-relevant keys whose values differ between cfg and a checkpoint's config."""
+    if stored is None:
+        return []
+    return [k for k in MODEL_KEYS if _get(cfg, k) != _get(stored, k)]
+
+
 def build_models(cfg: dict, device: torch.device):
     """Return (coarse, fine, peXYZ, peDir) built from the config, on device."""
     enc = cfg["model"].get("encoding", {})

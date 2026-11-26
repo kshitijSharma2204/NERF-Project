@@ -32,3 +32,20 @@ def test_v1_numbers_reproduce():
     res = evaluate_saved()
     assert res["mean_psnr"] == pytest.approx(29.90, abs=0.01)
     assert res["mean_ssim"] == pytest.approx(0.9448, abs=0.0001)
+
+
+def test_evaluate_refuses_config_that_differs_from_checkpoint(tiny_cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("NERF_DEVICE", "cpu")
+    train(copy.deepcopy(tiny_cfg), "cfg", resume=False, logroot=str(tmp_path))
+    other = copy.deepcopy(tiny_cfg)
+    other["model"]["far"] = 5.0
+    with pytest.raises(SystemExit):
+        evaluate(other, str(tmp_path / "cfg" / "checkpoint_last.pth"), str(tmp_path / "out"))
+
+
+def test_limited_smoke_eval_writes_to_separate_dir(tiny_cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("NERF_DEVICE", "cpu")
+    train(copy.deepcopy(tiny_cfg), "lim", resume=False, logroot=str(tmp_path))
+    evaluate(tiny_cfg, str(tmp_path / "lim" / "checkpoint_last.pth"), str(tmp_path / "o"), limit=1)
+    assert os.path.exists(tmp_path / "o" / "eval_first1" / "metrics.json")
+    assert not os.path.exists(tmp_path / "o" / "eval")

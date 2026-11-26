@@ -46,7 +46,10 @@ def _to_tuple(x):
 
 def _atomic_save(obj: dict, path: str) -> None:
     tmp = path + ".tmp"
-    torch.save(obj, tmp)
+    with open(tmp, "wb") as f:
+        torch.save(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
